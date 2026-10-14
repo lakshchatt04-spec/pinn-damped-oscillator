@@ -15,6 +15,12 @@ import time
 import argparse
 from pathlib import Path
 
+try:
+    from scipy.integrate import solve_ivp
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # Physics parameters
 # ---------------------------------------------------------------------------
@@ -143,12 +149,81 @@ def evaluate(model, device, n_pts=500):
     x_exact = analytical_solution(t_np)
     error = np.abs(x_pred - x_exact)
 
-    return t_np, x_pred, x_exact, error
+    # IC errors
+    ic_error_x = float(np.abs(x_pred[0] - x_exact[0])) if len(x_pred) > 0 else float('nan')
+    # derivative at t=0 approx
+    if len(t_np) > 1:
+        dt0 = t_np[1] - t_np[0]
+        v_pred0 = (x_pred[1] - x_pred[0]) / dt0 if dt0 > 0 else 0.0
+        v_exact0 = (x_exact[1] - x_exact[0]) / dt0 if dt0 > 0 else 0.0
+    else:
+        v_pred0 = v_exact0 = 0.0
+    ic_error_v = float(np.abs(v_pred0 - v_exact0))
+
+    return t_np, x_pred, x_exact, error, ic_error_x, ic_error_v
 
 
 # ---------------------------------------------------------------------------
-# Benchmarking (stretch goal: GPU vs CPU)
+# Numerical baselines: RK4 and SciPy solve_ivp
 # ---------------------------------------------------------------------------
+def ode_system(t, x_vec):
+    """State: [x, v]. Return [v, -2*GAMMA*v - OMEGA_0^2*x]."""
+    x, v = x_vec
+    dx = v
+    dv = -2.0 * GAMMA * v - OMEGA_0**2 * x
+    return np.array([dx, dv])
+
+
+def rk4_solution(t_eval):
+    """Compute numerical solution using 4th-order Runge-Kutta."""
+    t_eval = np.asarray(t_eval, dtype=float)
+    if len(t_eval) == 0:
+        return t_eval, np.zeros(0)
+    t0 = t_eval[0]
+    tf = t_eval[-1]
+    h = t_eval[1] - t_eval[0] if len(t_eval) > 1 else (tf - t0) / 1000.0
+    # If t_eval is dense and spans whole domain, use uniform h; otherwise fallback to simple stepping
+    x = np.zeros_like(t_eval, dtype=float)
+    v = np.zeros_like(t_eval, dtype=float)
+    x_cur, v_cur = IC_X0, IC_V0
+    x[0], v[0] = x_cur, v_cur
+    for i in range(1, len(t_eval)):
+        ti = t_eval[i - 1]
+        ti1 = t_eval[i]
+        h_i = ti1 - ti
+        k1x, k1v = ode_system(ti, np.array([x_cur, v_cur]))
+        k2x, k2v = ode_system(ti + h_i / 2.0, np.array([x_cur + h_i / 2.0 * k1x, v_cur + h_i / 2.0 * k1v]))
+        k3x, k3v = ode_system(ti + h_i / 2.0, np.array([x_cur + h_i / 2.0 * k2x, v_cur + h_i / 2.0 * k2v]))
+        k4x, k4v = ode_system(ti + h_i, np.array([x_cur + h_i * k3x, v_cur + h_i * k3v]))
+        x_cur = x_cur + h_i / 6.0 * (k1x + 2.0 * k2x + 2.0 * k3x + k4x)
+        v_cur = v_cur + h_i / 6.0 * (k1v + 2.0 * k2v + 2.0 * k3v + k4v)
+        x[i], v[i] = x_cur, v_cur
+    return t_eval, x
+
+
+def scipy_solution(t_eval):
+    """Compute numerical solution using SciPy solve_ivp."""
+    if not SCIPY_AVAILABLE:
+        raise ImportError("scipy is not available")
+    sol = solve_ivp(ode_system, (t_eval[0], t_eval[-1]), (IC_X0, IC_V0), t_eval=t_eval, method='RK45', rtol=1e-9, atol=1e-12)
+    if not sol.success:
+        raise RuntimeError(f"solve_ivp failed: {sol.message}")
+    return sol.t, sol.y[0]
+
+
+def get_numerical_baselines(t_eval):
+    results = {}
+    try:
+        t_rk, x_rk = rk4_solution(t_eval)
+        results['rk4'] = {'t': t_rk, 'x': x_rk}
+    except Exception as e:
+        results['rk4_error'] = str(e)
+    try:
+        t_sp, x_sp = scipy_solution(t_eval)
+        results['scipy'] = {'t': t_sp, 'x': x_sp}
+    except Exception as e:
+        results['scipy_error'] = str(e)
+    return results
 def benchmark(device_str, n_iters=2000):
     device = torch.device(device_str)
     print(f"\n--- Benchmark on {device} ({n_iters} iters) ---")
@@ -192,6 +267,7 @@ def main():
     parser.add_argument("--hidden", type=int, default=128)
     parser.add_argument("--layers", type=int, default=4)
     parser.add_argument("--colloc", type=int, default=400)
+    parser.add_argument("--n-eval", type=int, default=2000, help="Evaluation points (denser grid for max error)")
     parser.add_argument("--benchmark", action="store_true",
                         help="Run GPU vs CPU timing comparison")
     parser.add_argument("--save", action="store_true",
@@ -212,11 +288,13 @@ def main():
 
     # Evaluate
     print("\nEvaluating...")
-    t_np, x_pred, x_exact, error = evaluate(model, device)
+    t_np, x_pred, x_exact, error, ic_error_x, ic_error_v = evaluate(model, device, n_pts=args.n_eval)
     max_err = error.max()
     mean_err = error.mean()
     print(f"  Max absolute error:  {max_err:.6f}")
     print(f"  Mean absolute error: {mean_err:.6f}")
+    print(f"  IC error x(0):      {ic_error_x:.6f}")
+    print(f"  IC error v(0) (fd):  {ic_error_v:.6f}")
 
     # Save results
     if args.save:
@@ -226,6 +304,7 @@ def main():
         torch.save(model.state_dict(), out / "model.pt")
         np.savez(out / "predictions.npz",
                  t=t_np, x_pred=x_pred, x_exact=x_exact, error=error,
+                 ic_error_x=ic_error_x, ic_error_v=ic_error_v,
                  history_total=history["total"],
                  history_physics=history["physics"],
                  history_ic=history["ic"])
@@ -237,7 +316,7 @@ def main():
             matplotlib.use("Agg")
             import matplotlib.pyplot as plt
 
-            fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+            fig, axes = plt.subplots(1, 4, figsize=(18, 4))
 
             axes[0].plot(t_np, x_exact, "b-", label="Analytical", linewidth=2)
             axes[0].plot(t_np, x_pred, "r--", label="PINN", linewidth=2)
@@ -247,20 +326,44 @@ def main():
             axes[0].legend()
             axes[0].grid(True, alpha=0.3)
 
+            # also compare with numerical baselines if available
+            num = get_numerical_baselines(t_np)
+            if 'scipy' in num:
+                axes[0].plot(num['scipy']['t'], num['scipy']['x'], "k:", label="solve_ivp(RK45)", linewidth=1.5)
+            elif 'rk4' in num:
+                axes[0].plot(num['rk4']['t'], num['rk4']['x'], "k:", label="RK4", linewidth=1.5)
+            axes[0].legend()
+
             axes[1].semilogy(t_np, error + 1e-10)
             axes[1].set_xlabel("t")
             axes[1].set_ylabel("|Error|")
-            axes[1].set_title("Absolute Error")
+            axes[1].set_title("Absolute Error (PINN vs Analytical)")
             axes[1].grid(True, alpha=0.3)
 
-            axes[2].semilogy(history["total"], label="Total")
-            axes[2].semilogy(history["physics"], label="Physics")
-            axes[2].semilogy(history["ic"], label="IC")
-            axes[2].set_xlabel("Training step")
-            axes[2].set_ylabel("Loss")
-            axes[2].set_title("Training Loss")
-            axes[2].legend()
+            # comparison against numerical baseline errors if available
+            if 'scipy' in num:
+                err_num = np.abs(x_pred - num['scipy']['x'])
+                axes[2].semilogy(t_np, err_num + 1e-10, label='PINN vs solve_ivp')
+            elif 'rk4' in num:
+                err_num = np.abs(x_pred - num['rk4']['x'])
+                axes[2].semilogy(t_np, err_num + 1e-10, label='PINN vs RK4')
+            else:
+                axes[2].text(0.5, 0.5, 'Num. baseline\nunavailable', ha='center', va='center', transform=axes[2].transAxes)
+            axes[2].set_xlabel("t")
+            axes[2].set_ylabel("|Error|")
+            axes[2].set_title("PINN vs Numerical")
             axes[2].grid(True, alpha=0.3)
+            if 'scipy' in num or 'rk4' in num:
+                axes[2].legend()
+
+            axes[3].semilogy(history["total"], label="Total")
+            axes[3].semilogy(history["physics"], label="Physics")
+            axes[3].semilogy(history["ic"], label="IC")
+            axes[3].set_xlabel("Training step")
+            axes[3].set_ylabel("Loss")
+            axes[3].set_title("Training Loss")
+            axes[3].legend()
+            axes[3].grid(True, alpha=0.3)
 
             plt.tight_layout()
             plt.savefig(out / "results.png", dpi=150, bbox_inches="tight")
