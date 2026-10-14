@@ -84,11 +84,11 @@ pinn-damped-oscillator/
 └── results/           # (generated) model.pt, predictions.npz, results.png
 ```
 
-## Why This Matters (for interviews)
+## Why this project is useful
 
-- Combines **ML** (neural networks, training loops, autograd) with **physics** (ODEs, analytical solutions) — precisely the "computation and simulation" domain.
-- Demonstrates that you understand a model well enough to set up **a custom loss function** and troubleshoot why it does or doesn't converge — not just call frameworks.
-- Gives you a concrete, quantitative claim ("PINN reproduces the analytical damped-oscillator solution to ~6e-2 max / ~2e-2 mean absolute error") to discuss in an NVIDIA-style interview about ML + physical systems.
+This project combines neural networks with a physical system whose behavior can be calculated analytically. By training a physics-informed neural network (PINN) to solve the damped harmonic oscillator, I can investigate how the choice of loss function, training parameters, and differential-equation constraints affects the accuracy of the predicted solution.
+
+Comparing the network's predictions with the analytical solution provides a direct way to measure its accuracy and understand where the approach succeeds or struggles.
 
 ## Next Steps / Ideas
 
