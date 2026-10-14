@@ -46,10 +46,17 @@ def analytical_solution(t):
 # Neural network
 # ---------------------------------------------------------------------------
 class PINN(nn.Module):
-    """Simple fully-connected network: t -> x(t)."""
+    """Simple fully-connected network: t -> x(t).
 
-    def __init__(self, hidden=64, layers=4):
+    If hard_ic is True, the output is reparameterized as
+        x(t) = x0 + v0*t + t^2 * N(t)
+    which satisfies the initial conditions exactly for any network N(t).
+    Otherwise the ICs are imposed as a soft penalty (see ic_loss).
+    """
+
+    def __init__(self, hidden=64, layers=4, hard_ic=False):
         super().__init__()
+        self.hard_ic = hard_ic
         modules = [nn.Linear(1, hidden), nn.Tanh()]
         for _ in range(layers - 1):
             modules += [nn.Linear(hidden, hidden), nn.Tanh()]
@@ -57,7 +64,10 @@ class PINN(nn.Module):
         self.net = nn.Sequential(*modules)
 
     def forward(self, t):
-        return self.net(t)
+        n = self.net(t)
+        if self.hard_ic:
+            return IC_X0 + IC_V0 * t + t**2 * n
+        return n
 
 
 # ---------------------------------------------------------------------------
@@ -98,10 +108,19 @@ def ic_loss(model):
     return x_loss + v_loss
 
 
+def set_seed(seed):
+    """Make a run reproducible."""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
-def train(model, device, n_colloc=400, n_iters=15000, lr=1e-3, print_every=500):
+def train(model, device, n_colloc=400, n_iters=15000, lr=1e-3, print_every=500,
+          ic_weight=10.0, seed=None):
+    if seed is not None:
+        set_seed(seed)
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_iters)
@@ -115,7 +134,7 @@ def train(model, device, n_colloc=400, n_iters=15000, lr=1e-3, print_every=500):
 
         l_physics = physics_loss(model, t_colloc)
         l_ic = ic_loss(model)
-        loss = l_physics + 10.0 * l_ic
+        loss = l_physics + ic_weight * l_ic
 
         loss.backward()
         optimizer.step()
@@ -125,7 +144,7 @@ def train(model, device, n_colloc=400, n_iters=15000, lr=1e-3, print_every=500):
         history["physics"].append(l_physics.item())
         history["ic"].append(l_ic.item())
 
-        if i % print_every == 0 or i == 1:
+        if print_every and (i % print_every == 0 or i == 1):
             print(
                 f"  step {i:>5d}/{n_iters}  |  "
                 f"total: {loss.item():.6f}  physics: {l_physics.item():.6f}  "
@@ -149,16 +168,15 @@ def evaluate(model, device, n_pts=500):
     x_exact = analytical_solution(t_np)
     error = np.abs(x_pred - x_exact)
 
-    # IC errors
-    ic_error_x = float(np.abs(x_pred[0] - x_exact[0])) if len(x_pred) > 0 else float('nan')
-    # derivative at t=0 approx
-    if len(t_np) > 1:
-        dt0 = t_np[1] - t_np[0]
-        v_pred0 = (x_pred[1] - x_pred[0]) / dt0 if dt0 > 0 else 0.0
-        v_exact0 = (x_exact[1] - x_exact[0]) / dt0 if dt0 > 0 else 0.0
-    else:
-        v_pred0 = v_exact0 = 0.0
-    ic_error_v = float(np.abs(v_pred0 - v_exact0))
+    # Initial-condition errors computed exactly via autograd at t=0
+    # (not from the sampling grid, to avoid interpolation artifacts).
+    t0 = torch.zeros(1, 1, device=device, requires_grad=True)
+    x0 = model(t0)
+    v0 = torch.autograd.grad(
+        x0, t0, grad_outputs=torch.ones_like(x0), create_graph=False
+    )[0]
+    ic_error_x = float(abs(x0.item() - IC_X0))
+    ic_error_v = float(abs(v0.item() - IC_V0))
 
     return t_np, x_pred, x_exact, error, ic_error_x, ic_error_v
 
@@ -267,6 +285,12 @@ def main():
     parser.add_argument("--hidden", type=int, default=128)
     parser.add_argument("--layers", type=int, default=4)
     parser.add_argument("--colloc", type=int, default=400)
+    parser.add_argument("--ic-weight", type=float, default=10.0,
+                        help="Weight on the initial-condition loss term")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Random seed for reproducibility (default 0)")
+    parser.add_argument("--hard-ic", action="store_true",
+                        help="Hard-enforce ICs via x(t)=x0+v0*t+t^2*N(t)")
     parser.add_argument("--n-eval", type=int, default=2000, help="Evaluation points (denser grid for max error)")
     parser.add_argument("--benchmark", action="store_true",
                         help="Run GPU vs CPU timing comparison")
@@ -282,9 +306,10 @@ def main():
 
     # Train
     print(f"\nTraining PINN ({args.iters} iterations)...")
-    model = PINN(hidden=args.hidden, layers=args.layers)
+    model = PINN(hidden=args.hidden, layers=args.layers, hard_ic=args.hard_ic)
     history = train(model, device, n_colloc=args.colloc,
-                    n_iters=args.iters, lr=args.lr)
+                    n_iters=args.iters, lr=args.lr,
+                    ic_weight=args.ic_weight, seed=args.seed)
 
     # Evaluate
     print("\nEvaluating...")
