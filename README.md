@@ -88,7 +88,7 @@ pinn-damped-oscillator/
 
 - Combines **ML** (neural networks, training loops, autograd) with **physics** (ODEs, analytical solutions) — precisely the "computation and simulation" domain.
 - Demonstrates that you understand a model well enough to set up **a custom loss function** and troubleshoot why it does or doesn't converge — not just call frameworks.
-- Gives you a concrete, quantitative claim ("PINN reproduces the analytical damped-oscillator solution to ~1e-3 error") to discuss in an NVIDIA-style interview about ML + physical systems.
+- Gives you a concrete, quantitative claim ("PINN reproduces the analytical damped-oscillator solution to ~6e-2 max / ~2e-2 mean absolute error") to discuss in an NVIDIA-style interview about ML + physical systems.
 
 ## Next Steps / Ideas
 
